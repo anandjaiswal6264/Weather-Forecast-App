@@ -3,18 +3,27 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
+
 app = FastAPI(
     title="SkyCast Weather API",
-    version="1.0.0"
+    description="Live Weather Forecast and Air Quality API",
+    version="5.0.0"
 )
 
+
+# CORS Configuration: Localhost + Vercel
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://frontend-coral-alpha-0wz7uhci4x.vercel.app"
+    ],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -24,7 +33,11 @@ REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 
 async def get_json(url, params, headers=None):
     async with httpx.AsyncClient(timeout=25) as client:
-        response = await client.get(url, params=params, headers=headers)
+        response = await client.get(
+            url,
+            params=params,
+            headers=headers
+        )
         response.raise_for_status()
         return response.json()
 
@@ -40,7 +53,9 @@ async def get_location_name(latitude, longitude):
                 "zoom": 18,
                 "addressdetails": 1
             },
-            headers={"User-Agent": "SkyCastWeatherApp/5.0"}
+            headers={
+                "User-Agent": "SkyCastWeatherApp/5.0"
+            }
         )
 
         address = data.get("address", {})
@@ -62,7 +77,11 @@ async def get_location_name(latitude, longitude):
             or "Your Location"
         )
 
-        district = address.get("county") or address.get("state_district")
+        district = (
+            address.get("county")
+            or address.get("state_district")
+        )
+
         state = address.get("state", "")
         country = address.get("country", "")
 
@@ -73,12 +92,18 @@ async def get_location_name(latitude, longitude):
             "state": state,
             "country": country,
             "location_name": ", ".join(
-                part for part in [place, district, state, country] if part
+                part for part in [
+                    place,
+                    district,
+                    state,
+                    country
+                ] if part
             )
         }
 
     except Exception as error:
         print("Reverse geocoding error:", error)
+
         return {
             "city": "Your Location",
             "village": None,
@@ -90,26 +115,35 @@ async def get_location_name(latitude, longitude):
 
 
 async def get_weather(latitude, longitude):
+
     weather_params = {
         "latitude": latitude,
         "longitude": longitude,
+
         "current": (
-            "temperature_2m,relative_humidity_2m,apparent_temperature,"
-            "is_day,precipitation,weather_code,wind_speed_10m,"
-            "wind_direction_10m,wind_gusts_10m,pressure_msl,surface_pressure"
+            "temperature_2m,relative_humidity_2m,"
+            "apparent_temperature,is_day,precipitation,"
+            "weather_code,wind_speed_10m,wind_direction_10m,"
+            "wind_gusts_10m,pressure_msl,surface_pressure"
         ),
+
         "hourly": (
-            "temperature_2m,relative_humidity_2m,apparent_temperature,"
-            "pressure_msl,surface_pressure,visibility,uv_index,"
-            "wind_speed_10m,wind_direction_10m,wind_gusts_10m"
+            "temperature_2m,relative_humidity_2m,"
+            "apparent_temperature,pressure_msl,"
+            "surface_pressure,visibility,uv_index,"
+            "wind_speed_10m,wind_direction_10m,"
+            "wind_gusts_10m"
         ),
+
         "daily": (
-            "weather_code,temperature_2m_max,temperature_2m_min,"
-            "apparent_temperature_max,apparent_temperature_min,"
+            "weather_code,temperature_2m_max,"
+            "temperature_2m_min,apparent_temperature_max,"
+            "apparent_temperature_min,"
             "precipitation_probability_max,precipitation_sum,"
-            "uv_index_max,wind_speed_10m_max,wind_gusts_10m_max,"
-            "sunrise,sunset,moon_phase"
+            "uv_index_max,wind_speed_10m_max,"
+            "wind_gusts_10m_max,sunrise,sunset,moon_phase"
         ),
+
         "timezone": "auto",
         "forecast_days": 16
     }
@@ -117,20 +151,28 @@ async def get_weather(latitude, longitude):
     air_params = {
         "latitude": latitude,
         "longitude": longitude,
+
         "current": (
-            "us_aqi,european_aqi,pm10,pm2_5,carbon_monoxide,"
-            "nitrogen_dioxide,sulphur_dioxide,ozone"
+            "us_aqi,european_aqi,pm10,pm2_5,"
+            "carbon_monoxide,nitrogen_dioxide,"
+            "sulphur_dioxide,ozone"
         ),
+
         "hourly": (
-            "us_aqi,european_aqi,pm10,pm2_5,ozone,"
-            "nitrogen_dioxide,sulphur_dioxide"
+            "us_aqi,european_aqi,pm10,pm2_5,"
+            "ozone,nitrogen_dioxide,sulphur_dioxide"
         ),
+
         "timezone": "auto",
         "forecast_days": 7
     }
 
     try:
-        weather_data = await get_json(WEATHER_URL, weather_params)
+        weather_data = await get_json(
+            WEATHER_URL,
+            weather_params
+        )
+
     except Exception as error:
         raise HTTPException(
             status_code=502,
@@ -138,7 +180,11 @@ async def get_weather(latitude, longitude):
         )
 
     try:
-        air_data = await get_json(AIR_URL, air_params)
+        air_data = await get_json(
+            AIR_URL,
+            air_params
+        )
+
     except Exception as error:
         print("Air quality API error:", error)
         air_data = {}
@@ -146,6 +192,7 @@ async def get_weather(latitude, longitude):
     current = weather_data.get("current", {})
     hourly = weather_data.get("hourly", {})
     daily = weather_data.get("daily", {})
+
     air_current = air_data.get("current", {})
     air_hourly = air_data.get("hourly", {})
 
@@ -154,12 +201,14 @@ async def get_weather(latitude, longitude):
     air_times = air_hourly.get("time", [])
 
     hour_index = 0
+
     for i, time_value in enumerate(hourly_times):
         if time_value == current_time:
             hour_index = i
             break
 
     air_index = 0
+
     for i, time_value in enumerate(air_times):
         if time_value == current_time:
             air_index = i
@@ -167,14 +216,18 @@ async def get_weather(latitude, longitude):
 
     def hourly_value(key):
         values = hourly.get(key, [])
+
         if hour_index < len(values):
             return values[hour_index]
+
         return None
 
     def air_hourly_value(key):
         values = air_hourly.get(key, [])
+
         if air_index < len(values):
             return values[air_index]
+
         return None
 
     forecast = []
@@ -198,11 +251,14 @@ async def get_weather(latitude, longitude):
             "moon_phase": daily["moon_phase"][i]
         })
 
-    # Estimate next full moon from the daily moon-phase forecast.
-    # Moon phase: 0 = new moon, 0.5 = full moon.
+    # Estimate approximate full moon
+    # Moon phase: 0 = new moon, 0.5 = full moon
+
     full_moon = None
+
     for day in forecast:
         phase = day.get("moon_phase")
+
         if phase is not None and abs(phase - 0.5) <= 0.08:
             full_moon = {
                 "date": day["date"],
@@ -215,6 +271,7 @@ async def get_weather(latitude, longitude):
         "latitude": weather_data.get("latitude"),
         "longitude": weather_data.get("longitude"),
         "timezone": weather_data.get("timezone"),
+
         "current_weather": {
             "temperature": current.get("temperature_2m"),
             "feels_like": current.get("apparent_temperature"),
@@ -231,6 +288,7 @@ async def get_weather(latitude, longitude):
             "is_day": current.get("is_day"),
             "time": current_time
         },
+
         "air_quality": {
             "us_aqi": air_current.get("us_aqi"),
             "european_aqi": air_current.get("european_aqi"),
@@ -242,6 +300,7 @@ async def get_weather(latitude, longitude):
             "sulphur_dioxide": air_current.get("sulphur_dioxide"),
             "hourly_us_aqi": air_hourly_value("us_aqi")
         },
+
         "forecast": forecast[:7],
         "full_moon": full_moon
     }
@@ -262,7 +321,11 @@ async def live_weather(
     accuracy: float | None = Query(None, gt=0)
 ):
     data = await get_weather(latitude, longitude)
-    location = await get_location_name(latitude, longitude)
+
+    location = await get_location_name(
+        latitude,
+        longitude
+    )
 
     data.update(location)
     data["location_accuracy"] = accuracy
@@ -273,6 +336,7 @@ async def live_weather(
 
 @app.get("/api/weather/search/{city}")
 async def search_city(city: str):
+
     try:
         data = await get_json(
             GEOCODING_URL,
@@ -283,6 +347,7 @@ async def search_city(city: str):
                 "format": "json"
             }
         )
+
     except Exception as error:
         raise HTTPException(
             status_code=502,
@@ -313,6 +378,7 @@ async def search_city(city: str):
 
 @app.get("/api/weather/{city}")
 async def city_weather(city: str):
+
     try:
         data = await get_json(
             GEOCODING_URL,
@@ -323,6 +389,7 @@ async def city_weather(city: str):
                 "format": "json"
             }
         )
+
     except Exception as error:
         raise HTTPException(
             status_code=502,
@@ -332,10 +399,17 @@ async def city_weather(city: str):
     results = data.get("results", [])
 
     if not results:
-        raise HTTPException(status_code=404, detail="City not found")
+        raise HTTPException(
+            status_code=404,
+            detail="City not found"
+        )
 
     place = results[0]
-    weather = await get_weather(place["latitude"], place["longitude"])
+
+    weather = await get_weather(
+        place["latitude"],
+        place["longitude"]
+    )
 
     weather.update({
         "city": place.get("name", city),
@@ -343,6 +417,7 @@ async def city_weather(city: str):
         "district": place.get("admin2", ""),
         "state": place.get("admin1", ""),
         "country": place.get("country", ""),
+
         "location_name": ", ".join(
             part for part in [
                 place.get("name"),
@@ -350,6 +425,7 @@ async def city_weather(city: str):
                 place.get("country")
             ] if part
         ),
+
         "location_accuracy": None,
         "location_source": "City search"
     })
