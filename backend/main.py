@@ -1,17 +1,21 @@
 
+import asyncio
+import copy
+
+import httpx
+from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
 
 
 app = FastAPI(
     title="SkyCast Weather API",
     description="Live Weather Forecast and Air Quality API",
-    version="5.0.0"
+    version="6.0.0"
 )
 
 
-# CORS Configuration: Localhost + Vercel
+# CORS: Localhost + Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -31,8 +35,26 @@ GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 
 
+# ----------------------------------
+# CACHE CONFIGURATION
+# ----------------------------------
+
+# Weather and AQI: 10 minutes
+weather_cache = TTLCache(maxsize=500, ttl=600)
+
+# City search: 1 hour
+search_cache = TTLCache(maxsize=300, ttl=3600)
+
+# Reverse geocoding: 24 hours
+location_cache = TTLCache(maxsize=300, ttl=86400)
+
+# Prevent duplicate weather requests for same coordinates
+weather_inflight = {}
+weather_lock = asyncio.Lock()
+
+
 async def get_json(url, params, headers=None):
-    async with httpx.AsyncClient(timeout=25) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
             url,
             params=params,
@@ -42,7 +64,34 @@ async def get_json(url, params, headers=None):
         return response.json()
 
 
+async def get_search_results(city, count=5):
+    cache_key = f"{city.strip().lower()}:{count}"
+
+    if cache_key in search_cache:
+        return copy.deepcopy(search_cache[cache_key])
+
+    data = await get_json(
+        GEOCODING_URL,
+        {
+            "name": city,
+            "count": count,
+            "language": "en",
+            "format": "json"
+        }
+    )
+
+    results = data.get("results", [])
+    search_cache[cache_key] = results
+
+    return copy.deepcopy(results)
+
+
 async def get_location_name(latitude, longitude):
+    cache_key = (round(latitude, 3), round(longitude, 3))
+
+    if cache_key in location_cache:
+        return copy.deepcopy(location_cache[cache_key])
+
     try:
         data = await get_json(
             REVERSE_URL,
@@ -54,7 +103,7 @@ async def get_location_name(latitude, longitude):
                 "addressdetails": 1
             },
             headers={
-                "User-Agent": "SkyCastWeatherApp/5.0"
+                "User-Agent": "SkyCastWeatherApp/6.0"
             }
         )
 
@@ -85,7 +134,7 @@ async def get_location_name(latitude, longitude):
         state = address.get("state", "")
         country = address.get("country", "")
 
-        return {
+        result = {
             "city": place,
             "village": village,
             "district": district,
@@ -101,6 +150,9 @@ async def get_location_name(latitude, longitude):
             )
         }
 
+        location_cache[cache_key] = result
+        return copy.deepcopy(result)
+
     except Exception as error:
         print("Reverse geocoding error:", error)
 
@@ -114,19 +166,21 @@ async def get_location_name(latitude, longitude):
         }
 
 
-async def get_weather(latitude, longitude):
+# ----------------------------------
+# WEATHER DATA FETCH
+# ----------------------------------
+
+async def fetch_weather(latitude, longitude):
 
     weather_params = {
         "latitude": latitude,
         "longitude": longitude,
-
         "current": (
             "temperature_2m,relative_humidity_2m,"
             "apparent_temperature,is_day,precipitation,"
             "weather_code,wind_speed_10m,wind_direction_10m,"
             "wind_gusts_10m,pressure_msl,surface_pressure"
         ),
-
         "hourly": (
             "temperature_2m,relative_humidity_2m,"
             "apparent_temperature,pressure_msl,"
@@ -134,7 +188,6 @@ async def get_weather(latitude, longitude):
             "wind_speed_10m,wind_direction_10m,"
             "wind_gusts_10m"
         ),
-
         "daily": (
             "weather_code,temperature_2m_max,"
             "temperature_2m_min,apparent_temperature_max,"
@@ -143,7 +196,6 @@ async def get_weather(latitude, longitude):
             "uv_index_max,wind_speed_10m_max,"
             "wind_gusts_10m_max,sunrise,sunset,moon_phase"
         ),
-
         "timezone": "auto",
         "forecast_days": 16
     }
@@ -151,18 +203,15 @@ async def get_weather(latitude, longitude):
     air_params = {
         "latitude": latitude,
         "longitude": longitude,
-
         "current": (
             "us_aqi,european_aqi,pm10,pm2_5,"
             "carbon_monoxide,nitrogen_dioxide,"
             "sulphur_dioxide,ozone"
         ),
-
         "hourly": (
             "us_aqi,european_aqi,pm10,pm2_5,"
             "ozone,nitrogen_dioxide,sulphur_dioxide"
         ),
-
         "timezone": "auto",
         "forecast_days": 7
     }
@@ -171,6 +220,26 @@ async def get_weather(latitude, longitude):
         weather_data = await get_json(
             WEATHER_URL,
             weather_params
+        )
+
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 429:
+            retry_after = error.response.headers.get(
+                "Retry-After", "unknown"
+            )
+
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Weather provider rate limit reached. "
+                    f"Retry-After: {retry_after}. "
+                    "Please try again later."
+                )
+            )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Weather API error: {str(error)}"
         )
 
     except Exception as error:
@@ -251,9 +320,6 @@ async def get_weather(latitude, longitude):
             "moon_phase": daily["moon_phase"][i]
         })
 
-    # Estimate approximate full moon
-    # Moon phase: 0 = new moon, 0.5 = full moon
-
     full_moon = None
 
     for day in forecast:
@@ -306,13 +372,68 @@ async def get_weather(latitude, longitude):
     }
 
 
+# ----------------------------------
+# CACHED WEATHER FUNCTION
+# ----------------------------------
+
+async def get_weather(latitude, longitude):
+
+    cache_key = (
+        round(latitude, 2),
+        round(longitude, 2)
+    )
+
+    async with weather_lock:
+
+        if cache_key in weather_cache:
+            print("WEATHER CACHE HIT:", cache_key)
+            return copy.deepcopy(weather_cache[cache_key])
+
+        task = weather_inflight.get(cache_key)
+
+        if task is None:
+            print("WEATHER API REQUEST:", cache_key)
+
+            task = asyncio.create_task(
+                fetch_weather(latitude, longitude)
+            )
+
+            weather_inflight[cache_key] = task
+
+    try:
+        result = await task
+
+    except Exception:
+        async with weather_lock:
+            if weather_inflight.get(cache_key) is task:
+                weather_inflight.pop(cache_key, None)
+        raise
+
+    async with weather_lock:
+        weather_cache[cache_key] = result
+
+        if weather_inflight.get(cache_key) is task:
+            weather_inflight.pop(cache_key, None)
+
+    return copy.deepcopy(result)
+
+
+# ----------------------------------
+# HOME
+# ----------------------------------
+
 @app.get("/")
 async def home():
     return {
         "message": "SkyCast Weather API is running",
-        "version": "5.0.0"
+        "version": "6.0.0",
+        "cache_duration": "10 minutes"
     }
 
+
+# ----------------------------------
+# LIVE GPS WEATHER
+# ----------------------------------
 
 @app.get("/api/weather/location")
 async def live_weather(
@@ -320,6 +441,7 @@ async def live_weather(
     longitude: float = Query(..., ge=-180, le=180),
     accuracy: float | None = Query(None, gt=0)
 ):
+
     data = await get_weather(latitude, longitude)
 
     location = await get_location_name(
@@ -334,18 +456,20 @@ async def live_weather(
     return data
 
 
+# ----------------------------------
+# CITY SEARCH
+# ----------------------------------
+
 @app.get("/api/weather/search/{city}")
 async def search_city(city: str):
 
     try:
-        data = await get_json(
-            GEOCODING_URL,
-            {
-                "name": city,
-                "count": 5,
-                "language": "en",
-                "format": "json"
-            }
+        results = await get_search_results(city, count=5)
+
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Location search error: {str(error)}"
         )
 
     except Exception as error:
@@ -353,8 +477,6 @@ async def search_city(city: str):
             status_code=502,
             detail=f"Location search error: {str(error)}"
         )
-
-    results = data.get("results", [])
 
     if not results:
         raise HTTPException(
@@ -376,27 +498,21 @@ async def search_city(city: str):
     }
 
 
+# ----------------------------------
+# CITY WEATHER
+# ----------------------------------
+
 @app.get("/api/weather/{city}")
 async def city_weather(city: str):
 
     try:
-        data = await get_json(
-            GEOCODING_URL,
-            {
-                "name": city,
-                "count": 1,
-                "language": "en",
-                "format": "json"
-            }
-        )
+        results = await get_search_results(city, count=1)
 
     except Exception as error:
         raise HTTPException(
             status_code=502,
             detail=f"City search error: {str(error)}"
         )
-
-    results = data.get("results", [])
 
     if not results:
         raise HTTPException(
