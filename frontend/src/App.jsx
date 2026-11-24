@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+const API = "https://weather-forecast-app-ey48.onrender.com";
 
 function weatherInfo(code) {
   if (code === 0) return { label: "Clear Sky", Icon: Sun, type: "sunny" };
